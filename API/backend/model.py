@@ -2,9 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ==================================================
-# Core Blocks
-# ==================================================
+# 하이퍼파라미터
+IN_CHANNELS = 5
+OUT_CHANNELS = 1
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# 필요한 블록들만 유지
 class DoubleConv(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -69,14 +72,11 @@ class ASPP(nn.Module):
         x = torch.cat(feats, dim=1)
         return self.project(x)
 
-# ==================================================
-# Final Model: AttentionUNet2p5D_ASPP
-# ==================================================
 class AttentionUNet2p5D_ASPP(nn.Module):
-    def __init__(self, in_channels=5, out_channels=1):
+    def __init__(self):
         super().__init__()
         feats = [64, 128, 256, 512]
-        self.conv1, self.pool1 = DoubleConv(in_channels, feats[0]), nn.MaxPool2d(2)
+        self.conv1, self.pool1 = DoubleConv(IN_CHANNELS, feats[0]), nn.MaxPool2d(2)
         self.conv2, self.pool2 = DoubleConv(feats[0], feats[1]), nn.MaxPool2d(2)
         self.conv3, self.pool3 = DoubleConv(feats[1], feats[2]), nn.MaxPool2d(2)
         self.conv4, self.pool4 = DoubleConv(feats[2], feats[3]), nn.MaxPool2d(2)
@@ -92,7 +92,7 @@ class AttentionUNet2p5D_ASPP(nn.Module):
         self.dec2 = DoubleConv(feats[1]*2, feats[1])
         self.up1, self.att1 = nn.ConvTranspose2d(feats[1], feats[0], 2, 2), AttentionGate(feats[0], feats[0], feats[0]//2)
         self.dec1 = DoubleConv(feats[0]*2, feats[0])
-        self.conv_final = nn.Conv2d(feats[0], out_channels, 1)
+        self.conv_final = nn.Conv2d(feats[0], OUT_CHANNELS, 1)
 
     def forward(self, x):
         c1 = self.conv1(x);  p1 = self.pool1(c1)
@@ -107,3 +107,4 @@ class AttentionUNet2p5D_ASPP(nn.Module):
         d2 = self.up2(d3); c2a = self.att2(d2, c2); d2 = self.dec2(torch.cat([c2a, d2], dim=1))
         d1 = self.up1(d2); c1a = self.att1(d1, c1); d1 = self.dec1(torch.cat([c1a, d1], dim=1))
         return self.conv_final(d1)
+

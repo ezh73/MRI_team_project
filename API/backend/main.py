@@ -1,18 +1,16 @@
+# main.py
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+import os, tempfile, subprocess, sys
 import numpy as np
-import nibabel as nib
-import tempfile
-import subprocess
-import os
-import SimpleITK as sitk
-import cv2
 import torch
+import SimpleITK as sitk
+import nibabel as nib
+
 from model import AttentionUNet2p5D_ASPP
 
+# ─────────────────────── FastAPI 설정 ───────────────────────
 app = FastAPI()
-
-# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,113 +18,134 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 모델 로딩
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "./best_model.pth"
+# ─────────────────────── 모델 로드 ───────────────────────
+DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+MODEL_PATH = "./0711_BDTLoss_arguments.pth"
 IN_CHANNELS = 5
 
 model = AttentionUNet2p5D_ASPP().to(DEVICE)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 model.eval()
 
+# ─────────────────────── 리샘플링 함수 ───────────────────────
+def resample_xy_sitk(img: sitk.Image, new_size_xy=(256, 256), interp=sitk.sitkLinear):
+    size = list(img.GetSize())
+    spacing = list(img.GetSpacing())
+
+    size[0], size[1] = new_size_xy
+    spacing[0] = img.GetSpacing()[0] * img.GetSize()[0] / new_size_xy[0]
+    spacing[1] = img.GetSpacing()[1] * img.GetSize()[1] / new_size_xy[1]
+
+    rf = sitk.ResampleImageFilter()
+    rf.SetSize(size)
+    rf.SetOutputSpacing(spacing)
+    rf.SetOutputOrigin(img.GetOrigin())
+    rf.SetOutputDirection(img.GetDirection())
+    rf.SetInterpolator(interp)
+
+    return rf.Execute(img)
+
+# ─────────────────────── Z-score 정규화 ───────────────────────
+def numpy_zscore_normalize(data: np.ndarray, mask: np.ndarray, clip_sigma: float = 5.0):
+    vox = data[mask]
+    mu = vox.mean()
+    sigma = vox.std() if vox.std() > 0 else 1.0
+    z = (data - mu) / sigma
+    z = np.clip(z, -clip_sigma, clip_sigma)
+    return (z + clip_sigma) / (2 * clip_sigma)
+
+# ─────────────────────── HD-BET 실행 ───────────────────────
+def run_hd_bet(input_path: str, output_path: str) -> str:
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"입력 파일이 존재하지 않음: {input_path}")
+    if not output_path.endswith(".nii.gz"):
+        raise ValueError(f"출력 파일은 .nii.gz로 끝나야 합니다: {output_path}")
+
+    cmd = [
+        "hd-bet",
+        "-i", input_path,
+        "-o", output_path,
+        "-device", "cuda:1",
+        "--save_bet_mask"
+    ]
+
+    print("🚀 HD-BET 실행 중:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+    mask_path = output_path.replace(".nii.gz", "_bet.nii.gz")
+    if not os.path.exists(mask_path):
+        raise FileNotFoundError(f"❌ 마스크 파일이 생성되지 않음: {mask_path}")
+
+    return mask_path
+
+# ─────────────────────── 2.5D 입력 생성 ───────────────────────
+def create_2p5d_input(volume: np.ndarray, z: int) -> np.ndarray:
+    c, h, w = IN_CHANNELS, *volume.shape[1:]
+    half = c // 2
+    slices = []
+    for dz in range(-half, half + 1):
+        zz = np.clip(z + dz, 0, volume.shape[0] - 1)
+        slices.append(volume[zz])
+    return np.stack(slices, axis=0)  # [C, H, W]
+
+# ─────────────────────── 업로드 및 추론 ───────────────────────
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     with tempfile.TemporaryDirectory() as tmpdir:
-        in_path = os.path.join(tmpdir, file.filename)
-        out_path = os.path.join(tmpdir, "output_bet.nii.gz")
-
-        with open(in_path, "wb") as f:
+        input_path = os.path.join(tmpdir, file.filename)
+        with open(input_path, "wb") as f:
             f.write(await file.read())
 
-        ext = file.filename.lower()
-        if not (ext.endswith(".nii") or ext.endswith(".nii.gz")):
-            raise ValueError("NIfTI (.nii/.nii.gz) 파일만 지원합니다.")
+        # 1. HD-BET 실행
+        output_path = os.path.join(tmpdir, "stripped.nii.gz")
+        mask_path = run_hd_bet(input_path, output_path)
 
-        # HD-BET 실행
-        print("🧠 HD-BET 실행")
-        run_hd_bet(in_path, out_path)
+        # 2. 리샘플링 및 정규화
+        img_sitk = sitk.ReadImage(output_path)     
+        mask_sitk = sitk.ReadImage(mask_path) 
 
-        # HD-BET 결과 로딩
-        sitk_img = sitk.ReadImage(out_path)
+        img_xy = resample_xy_sitk(img_sitk, (256, 256), sitk.sitkLinear)
+        mask_xy = resample_xy_sitk(mask_sitk, (256, 256), sitk.sitkNearestNeighbor)
 
-        # 1. Resample
-        resampled = resample_to_spacing(sitk_img, new_spacing=(1.0, 1.0, 1.0))
-        volume = sitk.GetArrayFromImage(resampled)  # (Z, H, W)
-        volume = minmax_normalize(volume)
+        img = sitk.GetArrayFromImage(img_xy).astype(np.float32)  # [Z, H, W]
+        mask = sitk.GetArrayFromImage(mask_xy).astype(bool)
+
+        norm = numpy_zscore_normalize(img, mask)  # [Z, H, W]
+
+        # 3. 전체 슬라이스 추론
+        pred_masks = []
+        with torch.no_grad():
+            for z in range(norm.shape[0]):
+                input_tensor = create_2p5d_input(norm, z)
+                input_tensor = torch.from_numpy(input_tensor).unsqueeze(0).to(DEVICE)
+                pred = model(input_tensor)
+                pred_mask = (torch.sigmoid(pred[0, 0]) > 0.5).cpu().numpy().astype(np.uint8)
+                pred_masks.append(pred_mask)
+
+        pred_volume = np.stack(pred_masks, axis=0)  # [Z, H, W]
+
+        coords = np.argwhere(pred_volume == 1)
+        if len(coords) == 0:
+            z_index = norm.shape[0] // 2  # 종양 없을 때 중앙값으로 fallback
+        else:
+            z_index = int(round(coords[:, 0].mean()))  # Z 축 중심
 
 
-        # 2. 모든 z에 대해 예측
-        preds = []
-        for z in range(volume.shape[0]):
-            input_2p5d = extract_2p5d_input(volume, z, in_channels=IN_CHANNELS)
-            input_tensor = torch.from_numpy(input_2p5d).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
-                output = model(input_tensor)
-                prob = torch.sigmoid(output)[0, 0].cpu().numpy()
-            preds.append(prob)
+        # 4. 시각화용 변환 - 전체 슬라이스 변환
+        original_all = []
+        mask_all = []
 
-        # 3. 종양 활성도 가장 높은 z 선택
-        tumor_scores = [np.mean(p > 0.5) for p in preds]
-        best_z = int(np.argmax(tumor_scores))
-        best_prob = preds[best_z]
+        for i in range(norm.shape[0]):
+            slice_2d = norm[i]
+            slice_vis = (slice_2d - np.min(slice_2d)) / (np.max(slice_2d) - np.min(slice_2d) + 1e-8)
+            slice_vis = (slice_vis * 255).astype(np.uint8)
+            original_all.append(slice_vis.tolist())  
 
-        # 4. 시각화용 데이터 준비
-        orig_slice = volume[best_z]
-        orig_resized = resize_to_512(orig_slice)
-        slice_2d_vis = normalize_to_uint8(orig_resized)
-
-        mask_uint8 = (best_prob > 0.5).astype(np.uint8) * 255
+            mask_slice = pred_volume[i].astype(np.uint8) * 255
+            mask_all.append(mask_slice.tolist())     
 
         return {
-            "original": slice_2d_vis.tolist(),
-            "mask": mask_uint8.tolist(),
-            "z_index": best_z
+            "original": original_all,
+            "mask": mask_all,
+            "z_index": z_index
         }
-
-# ================================
-# 🔧 유틸리티 함수들
-# ================================
-
-def run_hd_bet(in_path, out_path):
-    try:
-        subprocess.run(
-            ["hd-bet", "-i", in_path, "-o", out_path, "-device", "cpu"],
-            check=True
-        )
-    except subprocess.CalledProcessError:
-        raise RuntimeError("HD-BET 실행 실패")
-
-def resample_to_spacing(image, new_spacing=(1.0, 1.0, 1.0)):
-    orig_spacing = image.GetSpacing()
-    orig_size = image.GetSize()
-    new_size = [
-        int(round(orig_size[i] * (orig_spacing[i] / new_spacing[i])))
-        for i in range(3)
-    ]
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetOutputSpacing(new_spacing)
-    resampler.SetSize(new_size)
-    resampler.SetOutputDirection(image.GetDirection())
-    resampler.SetOutputOrigin(image.GetOrigin())
-    resampler.SetInterpolator(sitk.sitkLinear)
-    return resampler.Execute(image)
-
-def minmax_normalize(volume):
-    volume = np.nan_to_num(volume)
-    v_min, v_max = volume.min(), volume.max()
-    return (volume - v_min) / (v_max - v_min + 1e-8)
-
-
-def normalize_to_uint8(img):
-    img = np.nan_to_num(img)
-    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-    return (img * 255).astype(np.uint8)
-
-def extract_2p5d_input(volume, z, in_channels=5):
-    half = in_channels // 2
-    z_indices = [np.clip(z + i, 0, volume.shape[0] - 1) for i in range(-half, half + 1)]
-    slices = [resize_to_512(volume[zi]) for zi in z_indices]
-    return np.stack(slices, axis=0).astype(np.float32)
-
-def resize_to_512(img):
-    return cv2.resize(img, (512, 512), interpolation=cv2.INTER_LINEAR)
